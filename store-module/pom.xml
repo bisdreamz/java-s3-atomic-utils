@@ -9,7 +9,7 @@
         <version>1.0-SNAPSHOT</version>
     </parent>
 
-    <artifactId>s3-pojo-store</artifactId>
+    <artifactId>s3-atomic-store</artifactId>
 
     <properties>
         <maven.compiler.release>17</maven.compiler.release>

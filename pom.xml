@@ -11,7 +11,7 @@
 
     <modules>
         <module>lock-module</module>
-        <module>pojo-module</module>
+        <module>store-module</module>
     </modules>
 
     <build>
