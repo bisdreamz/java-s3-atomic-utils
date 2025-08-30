@@ -20,10 +20,12 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 public class DistributedLock {
 
+    private static final Duration SAFETY_MARGIN = Duration.ofMillis(500);
     private static final ScheduledExecutorService EXECUTOR = Executors.newSingleThreadScheduledExecutor(t -> {
         Thread thread = new Thread(t);
 
@@ -45,6 +47,9 @@ public class DistributedLock {
      * @return {@link S3MockApplication} which should be stopped upon application shutdown
      */
     public static S3MockApplication getLocalMockServer(String dataDir, boolean keepFilesOnExit) {
+        if (dataDir == null)
+            throw new IllegalArgumentException("dataDir must not be null");
+
         return S3MockApplication.start(new HashMap<>(Map.of(
                 S3MockApplication.PROP_ROOT_DIRECTORY, dataDir,
                 S3MockApplication.PROP_HTTP_PORT, "9090", // you can make this dynamic if needed
@@ -151,12 +156,12 @@ public class DistributedLock {
     /**
      * Begin the repeating heartbeat tasks to refresh the remote lock instance and keep it live.
      *
-     * @param entry
-     * @param interval
-     * @param lockFut
-     * @return
+     * @param entry The lock entry containing bucket and key information
+     * @param interval The interval at which to refresh the lock expiry
+     * @param lockFut The future to complete exceptionally if heartbeat fails
+     * @return AtomicReference to the scheduled heartbeat task for cancellation
      */
-    private ScheduledFuture<?> scheduleLockRefresh(
+    private AtomicReference<ScheduledFuture<?>> scheduleLockRefresh(
             LockEntry entry,
             Duration interval,
             CompletableFuture<Void> lockFut
@@ -164,40 +169,57 @@ public class DistributedLock {
         if (interval.toSeconds() < 1)
             throw new IllegalArgumentException("Heartbeat interval must be at least 1 second");
 
-        Runnable runner = () -> {
-            String currentEtag = etagCache.get(entry.absUri());
+        long schedulingIntervalMs = interval.toMillis() - SAFETY_MARGIN.toMillis();
+        if (schedulingIntervalMs <= 0)
+            throw new IllegalArgumentException("Expiry interval must be greater than safety margin (" + SAFETY_MARGIN.toMillis() + "ms)");
 
-            putOrUpdateLock(entry.bucket(), entry.fileName(), interval, currentEtag)
-                    .whenComplete((newEtag, ex) -> {
-                        if (ex != null) {
-                            if (ex.getCause() instanceof S3Exception s3e) {
-                                int status = s3e.statusCode();
+        AtomicReference<ScheduledFuture<?>> futureRef = new AtomicReference<>();
 
-                                // if our lock file is gone or etag mismatch, someone borked us man!
-                                if (status == 404 || status == 412) {
-                                    lockFut.completeExceptionally(
-                                            new ExternalModificationException(
-                                                    "Lock file was externally modified or deleted (HTTP " + status + ")",
-                                                    s3e)
-                                    );
+        class HeartbeatTask implements Runnable {
+            @Override
+            public void run() {
+                String currentEtag = etagCache.get(entry.absUri());
 
-                                    return;
+                putOrUpdateLock(entry.bucket(), entry.fileName(), interval, currentEtag)
+                        .whenComplete((newEtag, ex) -> {
+                            if (ex != null) {
+                                if (ex.getCause() instanceof S3Exception s3e) {
+                                    int status = s3e.statusCode();
+
+                                    // if our lock file is gone or etag mismatch, someone borked us man!
+                                    if (status == 404 || status == 412) {
+                                        lockFut.completeExceptionally(
+                                                new ExternalModificationException(
+                                                        "Lock file was externally modified or deleted (HTTP " + status + ")",
+                                                        s3e)
+                                        );
+
+                                        return;
+                                    }
+                                }
+
+                                lockFut.completeExceptionally(ex);
+                            } else {
+                                etagCache.put(entry.absUri(), newEtag);
+                                
+                                // Self-schedule the next heartbeat if lock is still active
+                                if (!lockFut.isDone()) {
+                                    try {
+                                        futureRef.set(EXECUTOR.schedule(this, schedulingIntervalMs, TimeUnit.MILLISECONDS));
+                                    } catch (Exception schedEx) {
+                                        lockFut.completeExceptionally(new RuntimeException("Failed to schedule heartbeat", schedEx));
+                                    }
                                 }
                             }
+                        });
+            }
+        }
+        
+        HeartbeatTask runner = new HeartbeatTask();
 
-                            lockFut.completeExceptionally(ex);
-                        } else {
-                            etagCache.put(entry.absUri(), newEtag);
-                        }
-                    });
-        };
-
-        return EXECUTOR.scheduleAtFixedRate(
-                runner,
-                interval.toMillis(),
-                interval.toMillis(),
-                TimeUnit.MILLISECONDS
-        );
+        // Schedule the first heartbeat
+        futureRef.set(EXECUTOR.schedule(runner, schedulingIntervalMs, TimeUnit.MILLISECONDS));
+        return futureRef;
     }
 
     /**
@@ -236,22 +258,38 @@ public class DistributedLock {
             Duration maxLockDuration,
             Supplier<CompletableFuture<Void>> lockBody
     ) {
+        if (entry == null)
+            throw new NullPointerException("entry cannot be null");
+        if (expiryInterval == null)
+            throw new NullPointerException("expiryInterval cannot be null");
+        if (maxLockDuration == null)
+            throw new NullPointerException("maxLockDuration cannot be null");
+        if (lockBody == null)
+            throw new NullPointerException("lockBody cannot be null");
+        if (expiryInterval.compareTo(maxLockDuration) >= 0)
+            throw new IllegalArgumentException("expiryInterval must be less than maxLockDuration");
+        
         if (etagCache.containsKey(entry.absUri()))
             return CompletableFuture.failedFuture(new LocalLockExistsException("We already locally own lock " + entry.absUri()));
 
         CompletableFuture<Void> lockFut = new CompletableFuture<>();
 
-        headAndAcquireInitial(entry, maxLockDuration)
+        headAndAcquireInitial(entry, expiryInterval)
                 .thenCompose(etag -> {
                     etagCache.put(entry.absUri(), etag);
 
-                    ScheduledFuture<?> hb = scheduleLockRefresh(entry, expiryInterval, lockFut);
+                    AtomicReference<ScheduledFuture<?>> hbRef = scheduleLockRefresh(entry, expiryInterval, lockFut);
                     ScheduledFuture<?> watchdog = EXECUTOR.schedule(() -> {
                         lockFut.completeExceptionally(new TimeoutException("Lock " + entry.absUri() + " held longer than " + maxLockDuration));
                     }, maxLockDuration.toMillis(), TimeUnit.MILLISECONDS);
 
+                    // Ensure cleanup happens regardless of how lockFut completes
                     lockFut.whenComplete((__, ___) -> {
-                        hb.cancel(true);
+                        // Cancel heartbeat - use loop to handle race condition
+                        ScheduledFuture<?> hb;
+                        while ((hb = hbRef.getAndSet(null)) != null) {
+                            hb.cancel(true);
+                        }
                         watchdog.cancel(true);
                     });
 
