@@ -42,11 +42,12 @@ public class DistributedLock {
      * Convenience method for starting an apache S3Mock server to enable easy testing
      * with local fs storage.
      * @implNote Runs on port 9090, requires ssl be disabled and clients force path style access
+     * @param bucket The initial bucket to create
      * @param dataDir Directory to store data
      * @param keepFilesOnExit Whether to keep file data on exit. False to delete all data upon close.
      * @return {@link S3MockApplication} which should be stopped upon application shutdown
      */
-    public static S3MockApplication getLocalMockServer(String dataDir, boolean keepFilesOnExit) {
+    public static S3MockApplication getLocalMockServer(String bucket, String dataDir, boolean keepFilesOnExit) {
         if (dataDir == null)
             throw new IllegalArgumentException("dataDir must not be null");
 
@@ -54,10 +55,22 @@ public class DistributedLock {
                 S3MockApplication.PROP_ROOT_DIRECTORY, dataDir,
                 S3MockApplication.PROP_HTTP_PORT, "9090", // you can make this dynamic if needed
                 S3MockApplication.PROP_SECURE_CONNECTION, false,
-                S3MockApplication.PROP_INITIAL_BUCKETS, "default-mock-bucket",
+                S3MockApplication.PROP_INITIAL_BUCKETS, bucket,
                 S3MockApplication.PROP_SILENT, true,
                 "com.adobe.testing.s3mock.domain.retainFilesOnExit", keepFilesOnExit
         )));
+    }
+
+    /**
+     * Convenience method for starting an apache S3Mock server to enable easy testing
+     * with local fs storage. Uses "default-mock-bucket" as the initial bucket.
+     * @implNote Runs on port 9090, requires ssl be disabled and clients force path style access
+     * @param dataDir Directory to store data
+     * @param keepFilesOnExit Whether to keep file data on exit. False to delete all data upon close.
+     * @return {@link S3MockApplication} which should be stopped upon application shutdown
+     */
+    public static S3MockApplication getLocalMockServer(String dataDir, boolean keepFilesOnExit) {
+        return getLocalMockServer("default-mock-bucket", dataDir, keepFilesOnExit);
     }
 
     /**

@@ -39,7 +39,7 @@ class DistributedLockMockTest {
         if (!Files.exists(dataDir))
             dataDir = Files.createDirectory(dataDir);
 
-        mockServer = DistributedLock.getLocalMockServer(dataDir.toAbsolutePath().toString(), false);
+        mockServer = DistributedLock.getLocalMockServer(MOCK_BUCKET, dataDir.toAbsolutePath().toString(), false);
 
         Thread.sleep(1000);
 
