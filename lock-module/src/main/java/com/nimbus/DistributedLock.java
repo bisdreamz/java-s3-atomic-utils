@@ -149,8 +149,8 @@ public class DistributedLock {
     private CompletableFuture<String> putOrUpdateLock(String bucket, String key, Duration expiry, String expectedEtag) {
         PutObjectRequest.Builder putBuilder = PutObjectRequest.builder()
                 .bucket(bucket)
-                .key(key)
-                .ifMatch(expectedEtag)
+                .key(key)  .ifNoneMatch(expectedEtag == null ? "*" : null)  // Only create if doesn't exist
+                .ifMatch(expectedEtag)  // Only update if matches
                 .expires(Instant.now().plus(expiry));
 
         PutObjectRequest putReq = putBuilder.build();
